@@ -12,6 +12,10 @@ Web API, served at http://ac400.local once on Wi-Fi:
   POST /speed?value=0..3  0 is off, then low, medium, high
   POST /timer?value=0..3  0 cancels, then 1, 2 or 4 hours
 Both POSTs reply with the new state.
+
+A web speed command only lasts WEB_LEASE, so the fan stops by itself if
+whatever turned it on goes away. Repeat the same speed to renew it
+silently. Setting a timer, or using the buttons or remote, ends the lease.
 *********************************************************************/
 
 #include <WiFi.h>
@@ -20,6 +24,7 @@ Both POSTs reply with the new state.
 #include "secrets.h"
 
 #define HOSTNAME "ac400"
+#define WEB_LEASE 900000   // 15 minutes
 
 // The frames are decoded by decodeNecFromRawBuffer() below, so only one
 // of IRremote's own decoders needs compiling in.
@@ -90,6 +95,8 @@ unsigned long lastDebounceTime[2] = { 0, 0 };  // the last time the output pin w
 unsigned long debounceDelay = 50;    // the debounce time; increase if the output flickers
 
 bool lastChangeFromWeb = false;   // was the last change made through the web API?
+bool leaseActive = false;         // fan is running on a web lease
+unsigned long leaseStart;
 bool mdnsStarted = false;
 
 WebServer server(80);
@@ -270,6 +277,7 @@ void setSpeedOff()
   //digitalWrite(BEEP_PIN, HIGH);
   //delay(500);
   //digitalWrite(BEEP_PIN, LOW);
+  leaseActive = false;
   beep(500);
   speedOff();
   digitalWrite(SPEED_COMMON_PIN, RELAY_OFF);
@@ -373,9 +381,15 @@ void sendStatus()
   if(auto_off != AUTO_OFF && timerElapsed < auto_delay)
     timerRemaining = (auto_delay - timerElapsed) / 1000;
 
+  unsigned long leaseRemaining = 0;
+  unsigned long leaseElapsed = millis() - leaseStart;
+  if(leaseActive && leaseElapsed < WEB_LEASE)
+    leaseRemaining = (WEB_LEASE - leaseElapsed) / 1000;
+
   String json = "{\"speed\":" + String(speed) +
                 ",\"timer\":" + String(auto_off) +
                 ",\"timer_remaining_s\":" + String(timerRemaining) +
+                ",\"lease_remaining_s\":" + String(leaseRemaining) +
                 ",\"source\":\"" + (lastChangeFromWeb ? "web" : "manual") + "\"}\n";
   server.send(200, "application/json", json);
 }
@@ -406,7 +420,13 @@ void handleSpeed()
   if(level == SPEED_OFF)
     setSpeedOff();
   else
-    setSpeed(level);
+  {
+    // Same speed is a renewal, so skip setSpeed() and its beeps.
+    if(level != speed)
+      setSpeed(level);
+    leaseActive = true;
+    leaseStart = millis();
+  }
   lastChangeFromWeb = true;
   sendStatus();
 }
@@ -417,6 +437,8 @@ void handleTimer()
   if(level < 0)
     return;
   setAuto(level);
+  if(auto_off != AUTO_OFF)
+    leaseActive = false;
   lastChangeFromWeb = true;
   sendStatus();
 }
@@ -460,11 +482,13 @@ void loop()
   if(pressed(KEY_ON_PIN))
   {
     lastChangeFromWeb = false;
+    leaseActive = false;
     setNextSpeed();
   }
   if(pressed(KEY_OFF_PIN))
   {
     lastChangeFromWeb = false;
+    leaseActive = false;
     setSpeedOff();
   }
   
@@ -489,6 +513,7 @@ void loop()
     {
       lastKeyTime = millis();
       lastChangeFromWeb = false;
+      leaseActive = false;
       switch(command)
       {
         case KEY_ON_IR:
@@ -509,6 +534,9 @@ void loop()
   if(!mdnsStarted && WiFi.status() == WL_CONNECTED)
     mdnsStarted = MDNS.begin(HOSTNAME);
   server.handleClient();
+
+  if(leaseActive && millis() - leaseStart > WEB_LEASE)
+    setSpeedOff();
 
   if(auto_off != AUTO_OFF)
   {
