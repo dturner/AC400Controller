@@ -1,25 +1,36 @@
 /*********************************************************************
 Replacement controller board for Record Power AC400 air filtering system.
 
+Target board: Arduino Nano ESP32 (arduino:esp32:nano_nora).
+
 Requires:
-  IRLremote (https://github.com/NicoHood/IRLremote)
-Arduino standard libraries:
-  EEPROM
-  SoftwareSerial
+  IRremote 4.x (https://github.com/Arduino-IRremote/Arduino-IRremote)
 *********************************************************************/
 
-#include <IRLremote.h>
+// The frames are decoded by decodeNecFromRawBuffer() below, so only one
+// of IRremote's own decoders needs compiling in.
+#define DECODE_NEC
+#include <IRremote.hpp>
 
-#define LED_PIN     13
-#define IR_PIN       2
-#define BEEP_PIN     5
-#define KEY_ON_PIN   3
-#define KEY_OFF_PIN  4
-#define SPEED_ZERO_PIN 5
-#define SPEED_LOW_PIN 6
-#define SPEED_MEDIUM_PIN 7
-#define SPEED_HIGH_PIN 8
-#define SPEED_COMMON_PIN 9
+// Header pin labels, unchanged from the AVR wiring. The Nano ESP32 remaps
+// Dx/Ax to its own GPIOs, so always use the names rather than GPIO numbers.
+#define LED_PIN     D13
+#define IR_PIN      D2
+#define BEEP_PIN    D5
+
+// KEY_OFF_PIN must be KEY_ON_PIN + 1: pressed() indexes its debounce
+// arrays by (pin - KEY_ON_PIN).
+#define KEY_ON_PIN  D3
+#define KEY_OFF_PIN D4
+
+// The speed relays must be consecutive pins: setSpeed() writes
+// SPEED_ZERO_PIN + speed. Zero is never written (setSpeedOff() handles
+// that case), so sharing a pin with BEEP_PIN is harmless.
+#define SPEED_ZERO_PIN D5
+#define SPEED_LOW_PIN D6
+#define SPEED_MEDIUM_PIN D7
+#define SPEED_HIGH_PIN D8
+#define SPEED_COMMON_PIN D9
 
 #define LED_LOW_PIN A0
 #define LED_MEDIUM_PIN A1
@@ -30,7 +41,9 @@ Arduino standard libraries:
 
 #define RELAY_OFF LOW
 #define RELAY_ON HIGH
-#define KEY_ADDRESS 0xFF00
+// IRLremote reported the NEC address as 16 bits (0xFF00); IRremote splits
+// off the inverted byte, leaving 0x00.
+#define KEY_ADDRESS 0x00
 #define KEY_OFF_IR  0x90
 #define KEY_ON_IR   0x30
 #define KEY_TIME_IR 0xA0
@@ -52,8 +65,6 @@ Arduino standard libraries:
 //#define AUTO_THREE_DURATION 40000
 
 
-CNec IRLremote;
-
 int speed = SPEED_OFF;
 int auto_off = AUTO_OFF;
 unsigned long lastAutoTime;
@@ -66,12 +77,62 @@ unsigned long debounceDelay = 50;    // the debounce time; increase if the outpu
 
 void speedOff();
 
+/*
+ * This remote chains NEC frames with ~500us between them - shorter than the
+ * 1690us space of a data bit - so IRremote never sees an end-of-frame gap and
+ * concatenates several frames into one capture it then reports as UNKNOWN.
+ * Instead of relying on its framing, scan the raw buffer for a NEC header and
+ * decode the first valid frame after it. Returns true and fills aAddress /
+ * aCommand on success.
+ */
+bool decodeNecFromRawBuffer(uint16_t *aAddress, uint8_t *aCommand)
+{
+  const uint16_t rawlen = IrReceiver.decodedIRData.rawlen;
+
+  for(uint16_t i = 1; i + 2 + 64 <= rawlen; i++)
+  {
+    unsigned long headerMark = IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
+    unsigned long headerSpace = IrReceiver.irparams.rawbuf[i + 1] * MICROS_PER_TICK;
+    if(headerMark < 7500 || headerMark > 10500) continue;
+    if(headerSpace < 3500 || headerSpace > 5500) continue;
+
+    uint32_t data = 0;
+    bool valid = true;
+    for(uint8_t bit = 0; bit < 32; bit++)
+    {
+      unsigned long space = IrReceiver.irparams.rawbuf[i + 3 + (bit * 2)] * MICROS_PER_TICK;
+      if(space > 1200 && space < 2200)
+        data |= (1UL << bit);          // NEC sends LSB first
+      else if(space < 300 || space > 900)
+      {
+        valid = false;                 // neither a 0 nor a 1
+        break;
+      }
+    }
+    if(!valid) continue;
+
+    uint8_t address = data & 0xFF;
+    uint8_t addressInv = (data >> 8) & 0xFF;
+    uint8_t command = (data >> 16) & 0xFF;
+    uint8_t commandInv = (data >> 24) & 0xFF;
+    if(addressInv != (uint8_t)~address || commandInv != (uint8_t)~command)
+      continue;                        // checksum bytes disagree
+
+    *aAddress = address;
+    *aCommand = command;
+    return true;
+  }
+  return false;
+}
+
+unsigned long lastKeyTime = 0;   // when the last IR key was acted on
+
 void setup()
 {
   // put your setup code here, to run once:
   //Serial.begin(9600);
   //Serial.println("AC400 controller");
-  IRLremote.begin(IR_PIN);
+  IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
   
   pinMode(BEEP_PIN, OUTPUT);
   digitalWrite(BEEP_PIN, LOW);
@@ -320,15 +381,27 @@ void loop()
     setSpeedOff();
   }
   
-  if(IRLremote.available()) // have we received an IR signal?
+  if(IrReceiver.decode()) // have we received an IR signal?
   {
-    auto data = IRLremote.read();
-    //Serial.print(data.address, HEX);
-    //Serial.print(" ");
-    //Serial.println(data.command, HEX);
-    if(data.address == KEY_ADDRESS)
+    uint16_t address = 0;
+    uint8_t command = 0;
+    bool decoded = decodeNecFromRawBuffer(&address, &command);
+
+    //Serial.print("rawlen=");
+    //Serial.print(IrReceiver.decodedIRData.rawlen);
+    //Serial.print(" address=");
+    //Serial.print(address, HEX);
+    //Serial.print(" command=");
+    //Serial.println(command, HEX);
+
+    // One capture holds several repeats of the same frame, and holding a
+    // button produces captures back to back, so ignore anything arriving
+    // shortly after an accepted key.
+    bool toosoon = (millis() - lastKeyTime) < 400;
+    if(decoded && !toosoon && address == KEY_ADDRESS)
     {
-      switch(data.command)
+      lastKeyTime = millis();
+      switch(command)
       {
         case KEY_ON_IR:
           setNextSpeed();
@@ -341,6 +414,7 @@ void loop()
           break;
       }
     }
+    IrReceiver.resume();
   }
 
   if(auto_off != AUTO_OFF)
