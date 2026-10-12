@@ -5,7 +5,21 @@ Target board: Arduino Nano ESP32 (arduino:esp32:nano_nora).
 
 Requires:
   IRremote 4.x (https://github.com/Arduino-IRremote/Arduino-IRremote)
+  secrets.h - copy secrets.example.h and fill in the Wi-Fi details
+
+Web API, served at http://ac400.local once on Wi-Fi:
+  GET  /status            current state as JSON
+  POST /speed?value=0..3  0 is off, then low, medium, high
+  POST /timer?value=0..3  0 cancels, then 1, 2 or 4 hours
+Both POSTs reply with the new state.
 *********************************************************************/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include "secrets.h"
+
+#define HOSTNAME "ac400"
 
 // The frames are decoded by decodeNecFromRawBuffer() below, so only one
 // of IRremote's own decoders needs compiling in.
@@ -74,6 +88,11 @@ int buttonState[2] = { LOW, LOW };       // the current reading from the input p
 int lastButtonState[2] = { LOW, LOW };   // the previous reading from the input pin
 unsigned long lastDebounceTime[2] = { 0, 0 };  // the last time the output pin was toggled
 unsigned long debounceDelay = 50;    // the debounce time; increase if the output flickers
+
+bool lastChangeFromWeb = false;   // was the last change made through the web API?
+bool mdnsStarted = false;
+
+WebServer server(80);
 
 void speedOff();
 
@@ -160,6 +179,17 @@ void setup()
   pinMode(SPEED_COMMON_PIN, OUTPUT);
   digitalWrite(SPEED_COMMON_PIN, RELAY_OFF);
   speedOff();
+
+  // Don't wait for the connection: the buttons and remote must work
+  // without Wi-Fi. The core reconnects on its own if the link drops.
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/speed", HTTP_POST, handleSpeed);
+  server.on("/timer", HTTP_POST, handleTimer);
+  server.onNotFound([]() { server.send(404, "text/plain", "Not found\n"); });
+  server.begin();
 }
 
 void beep(unsigned long duration, unsigned long pause = 0)
@@ -336,6 +366,61 @@ void setNextAuto()
   setAuto(a);
 }
 
+void sendStatus()
+{
+  unsigned long timerRemaining = 0;
+  unsigned long timerElapsed = millis() - lastAutoTime;
+  if(auto_off != AUTO_OFF && timerElapsed < auto_delay)
+    timerRemaining = (auto_delay - timerElapsed) / 1000;
+
+  String json = "{\"speed\":" + String(speed) +
+                ",\"timer\":" + String(auto_off) +
+                ",\"timer_remaining_s\":" + String(timerRemaining) +
+                ",\"source\":\"" + (lastChangeFromWeb ? "web" : "manual") + "\"}\n";
+  server.send(200, "application/json", json);
+}
+
+// Reads the "value" argument (query string or form body) as 0..3.
+// Returns -1 and sends a 400 if it is missing or out of range.
+int levelArg()
+{
+  String value = server.arg("value");
+  if(value.length() != 1 || value[0] < '0' || value[0] > '3')
+  {
+    server.send(400, "text/plain", "value must be 0, 1, 2 or 3\n");
+    return -1;
+  }
+  return value[0] - '0';
+}
+
+void handleStatus()
+{
+  sendStatus();
+}
+
+void handleSpeed()
+{
+  int level = levelArg();
+  if(level < 0)
+    return;
+  if(level == SPEED_OFF)
+    setSpeedOff();
+  else
+    setSpeed(level);
+  lastChangeFromWeb = true;
+  sendStatus();
+}
+
+void handleTimer()
+{
+  int level = levelArg();
+  if(level < 0)
+    return;
+  setAuto(level);
+  lastChangeFromWeb = true;
+  sendStatus();
+}
+
 bool pressed(uint8_t key_pin)
 {
   // read the state of the switch into a local variable:
@@ -374,10 +459,12 @@ void loop()
 {
   if(pressed(KEY_ON_PIN))
   {
+    lastChangeFromWeb = false;
     setNextSpeed();
   }
   if(pressed(KEY_OFF_PIN))
   {
+    lastChangeFromWeb = false;
     setSpeedOff();
   }
   
@@ -401,6 +488,7 @@ void loop()
     if(decoded && !toosoon && address == KEY_ADDRESS)
     {
       lastKeyTime = millis();
+      lastChangeFromWeb = false;
       switch(command)
       {
         case KEY_ON_IR:
@@ -416,6 +504,11 @@ void loop()
     }
     IrReceiver.resume();
   }
+
+  // mDNS needs an IP address, so start it once the first connection is up.
+  if(!mdnsStarted && WiFi.status() == WL_CONNECTED)
+    mdnsStarted = MDNS.begin(HOSTNAME);
+  server.handleClient();
 
   if(auto_off != AUTO_OFF)
   {
