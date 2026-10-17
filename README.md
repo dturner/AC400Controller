@@ -25,7 +25,7 @@ This fork runs the controller on an [Arduino Nano ESP32](https://store.arduino.c
 
 ### Wi-Fi web API
 
-1. Copy `secrets.example.h` to `secrets.h` and enter your Wi-Fi network name and password. `secrets.h` is ignored by git. The ESP32 only supports 2.4GHz networks.
+1. Copy `secrets.example.h` to `secrets.h` and enter your Wi-Fi network name and password, plus a password for firmware updates. `secrets.h` is ignored by git. The ESP32 only supports 2.4GHz networks.
 2. Flash the sketch. The controller joins Wi-Fi and is available at `http://ac400.local`.
 
 | Request | Effect |
@@ -33,14 +33,15 @@ This fork runs the controller on an [Arduino Nano ESP32](https://store.arduino.c
 | `GET /status` | Returns the current state as JSON |
 | `POST /speed?value=0..3` | 0 is off, then low, medium, high |
 | `POST /timer?value=0..3` | 0 cancels, then 1, 2 or 4 hours |
+| `POST /update` | Installs new firmware (see below) |
 
-Both `POST` requests return the new state, for example:
+The speed and timer requests return the new state, for example:
 
 ```json
-{"speed":1,"timer":0,"timer_remaining_s":0,"lease_remaining_s":900,"source":"web"}
+{"speed":1,"timer":0,"timer_remaining_s":0,"lease_remaining_s":900,"source":"web","uptime_s":3600,"reset_reason":3}
 ```
 
-`source` shows whether the last change came from the web or from the buttons and remote.
+`source` shows whether the last change came from the web or from the buttons and remote. `uptime_s` is the time since the board last started, and `reset_reason` is why it last started ([ESP-IDF `esp_reset_reason_t`](https://docs.espressif.com/projects/esp-idf/en/v4.4/esp32s3/api-reference/system/system.html#_CPPv418esp_reset_reason_t): 1 power on, 3 software restart, 6 watchdog).
 
 A fan started from the web stops after 15 minutes unless the same speed is sent again, which renews it without beeping. This stops the fan running forever if whatever turned it on goes offline. Setting a timer, or using the buttons or remote, cancels this.
 
@@ -52,3 +53,20 @@ Example from a Mac (`-4` avoids a slow IPv6 lookup of `ac400.local`):
 curl -4 http://ac400.local/status
 curl -4 -X POST 'http://ac400.local/speed?value=2'
 ```
+
+### Firmware updates over Wi-Fi
+
+Once the board is running this firmware, new versions can be installed without a USB cable. User name is `admin` and the password is `OTA_PASSWORD` from `secrets.h`:
+
+```sh
+arduino-cli compile --fqbn arduino:esp32:nano_nora --output-dir build .
+curl -4 -u admin:YOUR_OTA_PASSWORD -F image=@build/AC400Controller.ino.bin http://ac400.local/update
+```
+
+An update takes about 40 seconds, during which the buttons and remote don't respond. The board then restarts with the fan off.
+
+### Reliability
+
+- The controller checks its Wi-Fi connection every 30 seconds and reconnects if it has dropped.
+- If the main loop stops for 10 seconds, a watchdog restarts the board.
+- Wi-Fi connects and disconnects are logged to the USB serial port at 115200 baud.

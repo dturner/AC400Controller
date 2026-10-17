@@ -5,13 +5,20 @@ Target board: Arduino Nano ESP32 (arduino:esp32:nano_nora).
 
 Requires:
   IRremote 4.x (https://github.com/Arduino-IRremote/Arduino-IRremote)
-  secrets.h - copy secrets.example.h and fill in the Wi-Fi details
+  secrets.h - copy secrets.example.h and fill in the Wi-Fi and update details
 
 Web API, served at http://ac400.local once on Wi-Fi:
   GET  /status            current state as JSON
   POST /speed?value=0..3  0 is off, then low, medium, high
   POST /timer?value=0..3  0 cancels, then 1, 2 or 4 hours
-Both POSTs reply with the new state.
+  POST /update            new firmware, see below
+Both speed and timer POSTs reply with the new state.
+
+Firmware updates over Wi-Fi, using the password from secrets.h:
+  arduino-cli compile --fqbn arduino:esp32:nano_nora --output-dir build .
+  curl -u admin:OTA_PASSWORD -F image=@build/AC400Controller.ino.bin http://ac400.local/update
+
+Wi-Fi events are logged to the USB serial port at 115200 baud.
 
 A web speed command only lasts WEB_LEASE, so the fan stops by itself if
 whatever turned it on goes away. Repeat the same speed to renew it
@@ -21,10 +28,14 @@ silently. Setting a timer, or using the buttons or remote, ends the lease.
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <Update.h>
+#include <esp_task_wdt.h>
 #include "secrets.h"
 
 #define HOSTNAME "ac400"
 #define WEB_LEASE 900000   // 15 minutes
+#define WIFI_CHECK_INTERVAL 30000
+#define WATCHDOG_TIMEOUT_S 10   // restart if loop() stalls this long
 
 // The frames are decoded by decodeNecFromRawBuffer() below, so only one
 // of IRremote's own decoders needs compiling in.
@@ -98,8 +109,10 @@ bool lastChangeFromWeb = false;   // was the last change made through the web AP
 bool leaseActive = false;         // fan is running on a web lease
 unsigned long leaseStart;
 bool mdnsStarted = false;
+unsigned long lastWifiCheck = 0;
 
 WebServer server(80);
+bool updateAuthorised = false;
 
 void speedOff();
 
@@ -155,9 +168,14 @@ unsigned long lastKeyTime = 0;   // when the last IR key was acted on
 
 void setup()
 {
-  // put your setup code here, to run once:
-  //Serial.begin(9600);
-  //Serial.println("AC400 controller");
+  // Don't let logging stall the controller when nothing is listening on USB.
+  Serial.setTxTimeoutMs(0);
+  Serial.begin(115200);
+  Serial.printf("AC400 controller, reset reason %d\n", esp_reset_reason());
+
+  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+
   IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
   
   pinMode(BEEP_PIN, OUTPUT);
@@ -189,14 +207,87 @@ void setup()
 
   // Don't wait for the connection: the buttons and remote must work
   // without Wi-Fi. The core reconnects on its own if the link drops.
+  WiFi.onEvent(onWifiEvent);
   WiFi.setHostname(HOSTNAME);
+  // Power saving makes the link slow and flaky, and the board is mains powered.
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/speed", HTTP_POST, handleSpeed);
   server.on("/timer", HTTP_POST, handleTimer);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found\n"); });
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
+}
+
+// Called for each chunk of an upload. The whole upload runs inside one
+// handleClient() call, so feed the watchdog here, including for uploads
+// that are being rejected.
+void handleUpdateUpload()
+{
+  esp_task_wdt_reset();
+  HTTPUpload& upload = server.upload();
+  if(upload.status == UPLOAD_FILE_START)
+  {
+    updateAuthorised = server.authenticate("admin", OTA_PASSWORD);
+    if(updateAuthorised)
+    {
+      Serial.println("Firmware update started");
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    }
+  }
+  else if(!updateAuthorised)
+    return;
+  else if(upload.status == UPLOAD_FILE_WRITE)
+    Update.write(upload.buf, upload.currentSize);
+  else if(upload.status == UPLOAD_FILE_END)
+    Update.end(true);
+  else if(upload.status == UPLOAD_FILE_ABORTED)
+    Update.abort();
+}
+
+void handleUpdateDone()
+{
+  if(!updateAuthorised)
+    return server.requestAuthentication();
+  if(Update.hasError())
+  {
+    server.send(500, "text/plain", String("Update failed: ") + Update.errorString() + "\n");
+    return;
+  }
+  server.send(200, "text/plain", "Update done, restarting\n");
+  Serial.println("Firmware update done, restarting");
+  delay(100);
+  ESP.restart();
+}
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+  switch(event)
+  {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("Wi-Fi connected, IP %s\n", WiFi.localIP().toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("Wi-Fi disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
+      break;
+    default:
+      break;
+  }
+}
+
+// The core's own reconnect gives up after some failures, so retry here too.
+void checkWifi()
+{
+  if(millis() - lastWifiCheck < WIFI_CHECK_INTERVAL)
+    return;
+  lastWifiCheck = millis();
+  if(WiFi.status() == WL_CONNECTED)
+    return;
+  Serial.printf("Wi-Fi not connected (status %d), retrying\n", WiFi.status());
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 void beep(unsigned long duration, unsigned long pause = 0)
@@ -390,7 +481,9 @@ void sendStatus()
                 ",\"timer\":" + String(auto_off) +
                 ",\"timer_remaining_s\":" + String(timerRemaining) +
                 ",\"lease_remaining_s\":" + String(leaseRemaining) +
-                ",\"source\":\"" + (lastChangeFromWeb ? "web" : "manual") + "\"}\n";
+                ",\"source\":\"" + (lastChangeFromWeb ? "web" : "manual") + "\"" +
+                ",\"uptime_s\":" + String(millis() / 1000) +
+                ",\"reset_reason\":" + String(esp_reset_reason()) + "}\n";
   server.send(200, "application/json", json);
 }
 
@@ -479,6 +572,8 @@ bool pressed(uint8_t key_pin)
 
 void loop()
 {
+  esp_task_wdt_reset();
+
   if(pressed(KEY_ON_PIN))
   {
     lastChangeFromWeb = false;
@@ -533,6 +628,7 @@ void loop()
   // mDNS needs an IP address, so start it once the first connection is up.
   if(!mdnsStarted && WiFi.status() == WL_CONNECTED)
     mdnsStarted = MDNS.begin(HOSTNAME);
+  checkWifi();
   server.handleClient();
 
   if(leaseActive && millis() - leaseStart > WEB_LEASE)
