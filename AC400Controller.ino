@@ -211,9 +211,13 @@ void setup()
   WiFi.setHostname(HOSTNAME);
   // Power saving makes the link slow and flaky, and the board is mains powered.
   WiFi.setSleep(false);
+  // By default the core joins the first access point it finds with this SSID.
+  // Scan every channel so it can pick the strongest one instead.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/wifi", HTTP_GET, handleWifi);
   server.on("/speed", HTTP_POST, handleSpeed);
   server.on("/timer", HTTP_POST, handleTimer);
   server.onNotFound([]() { server.send(404, "text/plain", "Not found\n"); });
@@ -503,6 +507,32 @@ int levelArg()
 void handleStatus()
 {
   sendStatus();
+}
+
+// Lists the access points for our network, strongest first, so we can see
+// which one the board is on and which ones it can hear.
+void handleWifi()
+{
+  int count = WiFi.scanNetworks();
+  String json = "{\"bssid\":\"" + WiFi.BSSIDstr() + "\"" +
+                ",\"channel\":" + String(WiFi.channel()) +
+                ",\"rssi\":" + String(WiFi.RSSI()) +
+                ",\"seen\":[";
+  bool first = true;
+  for(int i = 0; i < count; i++)
+  {
+    if(WiFi.SSID(i) != WIFI_SSID)
+      continue;
+    if(!first)
+      json += ",";
+    first = false;
+    json += "{\"bssid\":\"" + WiFi.BSSIDstr(i) + "\"" +
+            ",\"channel\":" + String(WiFi.channel(i)) +
+            ",\"rssi\":" + String(WiFi.RSSI(i)) + "}";
+  }
+  json += "]}\n";
+  WiFi.scanDelete();
+  server.send(200, "application/json", json);
 }
 
 void handleSpeed()
